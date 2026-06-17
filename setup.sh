@@ -42,14 +42,26 @@ echo "============================================"
 # ----------------------------
 echo "[1/6] 패키지 설치 중..."
 
+install_node20() {
+    echo "  Node.js 20 설치 중..."
+    if [ "$PKG" = "apt" ]; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+        sudo apt install -y nodejs
+    else
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
+        sudo yum install -y nodejs
+    fi
+}
+
 if [ "$PKG" = "apt" ]; then
     sudo apt update -qq
     sudo apt install -y mysql-server nginx curl 2>/dev/null
 
     if ! command -v node &> /dev/null; then
-        echo "  Node.js 설치 중..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-        sudo apt install -y nodejs
+        install_node20
+    elif [ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 18 ]; then
+        echo "  Node.js $(node -v) 감지 — Next.js 15는 Node.js 18+ 필요. 업그레이드합니다."
+        install_node20
     fi
 
 elif [ "$PKG" = "yum" ]; then
@@ -67,9 +79,10 @@ elif [ "$PKG" = "yum" ]; then
     sudo yum install -y mysql-community-server nginx curl 2>/dev/null
 
     if ! command -v node &> /dev/null; then
-        echo "  Node.js 설치 중..."
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
-        sudo yum install -y nodejs
+        install_node20
+    elif [ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 18 ]; then
+        echo "  Node.js $(node -v) 감지 — Next.js 15는 Node.js 18+ 필요. 업그레이드합니다."
+        install_node20
     fi
 
     # SELinux: nginx가 upstream으로 프록시 가능하게
@@ -266,7 +279,7 @@ NGINX
     sudo sed -i '/^\s*server\s*{/,/^\s*}/s/^/#/' /etc/nginx/nginx.conf 2>/dev/null || true
 fi
 
-sudo nginx -t && sudo systemctl reload nginx
+sudo nginx -t && (sudo systemctl reload nginx 2>/dev/null || sudo systemctl start nginx)
 sudo systemctl enable nginx
 
 # ----------------------------
