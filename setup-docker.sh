@@ -41,6 +41,7 @@ echo "[2/4] nginx 설정 중..."
 if command -v apt &> /dev/null; then
     apt install -y nginx 2>/dev/null
 elif command -v yum &> /dev/null; then
+    yum install -y epel-release 2>/dev/null || true
     yum install -y nginx 2>/dev/null
 fi
 
