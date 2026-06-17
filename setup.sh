@@ -3,7 +3,7 @@ set -e
 
 # ============================================
 # react2shell 실습 환경 자동 구축 스크립트
-# 대상: Ubuntu 22.04 / 24.04
+# 대상: Ubuntu 22.04/24.04, CentOS 7/8/9, Rocky, AlmaLinux
 # 구성: Next.js + MySQL + nginx (호스트 직접 실행)
 # ============================================
 
@@ -11,8 +11,27 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_USER="$(whoami)"
 SERVER_IP="$(hostname -I | awk '{print $1}')"
 
+# OS 감지
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+else
+    echo "[!] /etc/os-release 없음. 지원되지 않는 OS입니다."
+    exit 1
+fi
+
+case "$OS_ID" in
+    ubuntu|debian) PKG="apt" ;;
+    centos|rocky|almalinux|rhel|fedora) PKG="yum" ;;
+    *)
+        echo "[!] 지원되지 않는 OS: $OS_ID"
+        exit 1
+        ;;
+esac
+
 echo "============================================"
 echo " react2shell 실습 환경 구축"
+echo " OS:      $OS_ID ($PKG)"
 echo " APP_DIR: $APP_DIR"
 echo " USER:    $APP_USER"
 echo " IP:      $SERVER_IP"
@@ -22,14 +41,47 @@ echo "============================================"
 # 1. 시스템 패키지 설치
 # ----------------------------
 echo "[1/6] 패키지 설치 중..."
-sudo apt update -qq
-sudo apt install -y mysql-server nginx curl 2>/dev/null
 
-# Node.js 설치 (없으면)
-if ! command -v node &> /dev/null; then
-    echo "[1/6] Node.js 설치 중..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-    sudo apt install -y nodejs
+if [ "$PKG" = "apt" ]; then
+    sudo apt update -qq
+    sudo apt install -y mysql-server nginx curl 2>/dev/null
+
+    if ! command -v node &> /dev/null; then
+        echo "  Node.js 설치 중..."
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+        sudo apt install -y nodejs
+    fi
+
+elif [ "$PKG" = "yum" ]; then
+    # EPEL 활성화
+    sudo yum install -y epel-release 2>/dev/null || true
+
+    # MySQL 저장소 추가 (없으면)
+    if ! rpm -qa | grep -q mysql-community-release; then
+        CENTOS_VER=$(rpm -E %{rhel} 2>/dev/null || echo "8")
+        sudo yum install -y "https://dev.mysql.com/get/mysql80-community-release-el${CENTOS_VER}-1.noarch.rpm" 2>/dev/null || true
+        # GPG 키 임포트
+        sudo rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 2>/dev/null || true
+    fi
+
+    sudo yum install -y mysql-community-server nginx curl 2>/dev/null
+
+    if ! command -v node &> /dev/null; then
+        echo "  Node.js 설치 중..."
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
+        sudo yum install -y nodejs
+    fi
+
+    # SELinux: nginx가 upstream으로 프록시 가능하게
+    if command -v setsebool &> /dev/null; then
+        sudo setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+    fi
+
+    # 방화벽 80 포트 오픈
+    if command -v firewall-cmd &> /dev/null; then
+        sudo firewall-cmd --permanent --add-service=http 2>/dev/null || true
+        sudo firewall-cmd --reload 2>/dev/null || true
+    fi
 fi
 
 echo "  node: $(node -v), npm: $(npm -v)"
@@ -38,6 +90,14 @@ echo "  node: $(node -v), npm: $(npm -v)"
 # 2. MySQL 설정
 # ----------------------------
 echo "[2/6] MySQL 설정 중..."
+
+# MySQL 서비스 이름 (CentOS는 mysqld, Ubuntu는 mysql)
+if [ "$PKG" = "yum" ]; then
+    MYSQL_SVC="mysqld"
+else
+    MYSQL_SVC="mysql"
+fi
+
 sudo mkdir -p /var/lib/mysql-files
 sudo chown mysql:mysql /var/lib/mysql-files
 sudo chmod 750 /var/lib/mysql-files
@@ -46,17 +106,30 @@ sudo chmod 750 /var/lib/mysql-files
 if [ -d /etc/mysql/mariadb.conf.d ]; then
     sudo rm -f /etc/mysql/mariadb.conf.d/provider_*.cnf
 fi
-
-# FROZEN 파일 제거 (있으면)
 sudo rm -f /etc/mysql/FROZEN
 
-sudo systemctl restart mysql 2>/dev/null || {
+# MySQL 시작 시도
+if ! sudo systemctl restart $MYSQL_SVC 2>/dev/null; then
     echo "  MySQL 초기화 필요..."
     sudo rm -rf /var/lib/mysql/*
     sudo mysqld --initialize-insecure --user=mysql 2>/dev/null
-    sudo systemctl start mysql
-}
-sudo systemctl enable mysql
+    sudo systemctl start $MYSQL_SVC
+fi
+sudo systemctl enable $MYSQL_SVC
+
+# CentOS에서 임시 비밀번호 처리
+if [ "$PKG" = "yum" ]; then
+    TEMP_PW=$(sudo grep 'temporary password' /var/log/mysqld.log 2>/dev/null | tail -1 | awk '{print $NF}')
+    if [ -n "$TEMP_PW" ]; then
+        # 임시 비밀번호가 있으면 비밀번호 정책 완화 후 리셋
+        sudo mysql -u root -p"$TEMP_PW" --connect-expired-password -e "
+            ALTER USER 'root'@'localhost' IDENTIFIED BY 'TempRoot@1234';
+            SET GLOBAL validate_password.policy=LOW;
+            SET GLOBAL validate_password.length=4;
+            ALTER USER 'root'@'localhost' IDENTIFIED BY '';
+        " 2>/dev/null || true
+    fi
+fi
 
 # DB, 계정, 테이블 생성
 sudo mysql -u root <<'EOSQL'
@@ -147,7 +220,10 @@ npm run build 2>&1 | tail -5
 # 4. nginx 설정
 # ----------------------------
 echo "[4/6] nginx 설정 중..."
-sudo tee /etc/nginx/sites-available/react2shell > /dev/null <<NGINX
+
+if [ "$PKG" = "apt" ]; then
+    # Ubuntu: sites-available/sites-enabled 구조
+    sudo tee /etc/nginx/sites-available/react2shell > /dev/null <<NGINX
 server {
     listen 80;
     server_name $SERVER_IP;
@@ -164,10 +240,34 @@ server {
     }
 }
 NGINX
+    sudo ln -sf /etc/nginx/sites-available/react2shell /etc/nginx/sites-enabled/react2shell
+    sudo rm -f /etc/nginx/sites-enabled/default
 
-sudo ln -sf /etc/nginx/sites-available/react2shell /etc/nginx/sites-enabled/react2shell
-sudo rm -f /etc/nginx/sites-enabled/default
+elif [ "$PKG" = "yum" ]; then
+    # CentOS: conf.d 구조
+    sudo tee /etc/nginx/conf.d/react2shell.conf > /dev/null <<NGINX
+server {
+    listen 80;
+    server_name $SERVER_IP;
+
+    access_log /var/log/nginx/react2shell_access.log;
+    error_log /var/log/nginx/react2shell_error.log;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+    # 기본 server 블록 비활성화
+    sudo sed -i '/^\s*server\s*{/,/^\s*}/s/^/#/' /etc/nginx/nginx.conf 2>/dev/null || true
+fi
+
 sudo nginx -t && sudo systemctl reload nginx
+sudo systemctl enable nginx
 
 # ----------------------------
 # 5. systemd 서비스 등록
@@ -176,7 +276,7 @@ echo "[5/6] systemd 서비스 등록 중..."
 sudo tee /etc/systemd/system/react2shell.service > /dev/null <<SERVICE
 [Unit]
 Description=NexTech React2Shell App
-After=network.target mysql.service
+After=network.target $MYSQL_SVC.service
 
 [Service]
 Type=simple
